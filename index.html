@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>QR Spike Scanner</title>
+<style>
+  :root { --bg:#f6f6f3; --fg:#1b1b1b; --muted:#666; --card:#fff; --ok:#1f7a3a; --bad:#b3261e; --line:#ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#121212; --fg:#eee; --muted:#9a9a9a; --card:#1d1d1d; --ok:#5fd18a; --bad:#ff8a80; --line:#333; }
+  }
+  :root[data-theme="dark"] { --bg:#121212; --fg:#eee; --muted:#9a9a9a; --card:#1d1d1d; --ok:#5fd18a; --bad:#ff8a80; --line:#333; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  video { width:100%; max-height:45vh; object-fit:cover; background:#000; border-radius:8px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; margin:8px 0; overflow-wrap:anywhere; }
+  .muted { color:var(--muted); } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  progress { width:100%; height:14px; }
+  pre { white-space:pre-wrap; margin:8px 0 0; font-size:13px; max-height:40vh; overflow:auto; }
+</style>
+</head>
+<body>
+<h1>QR Spike Scanner</h1>
+<p class="muted">Point the camera at the TV while the add-on cycles its frames. Images stay on this phone. Only decoded text is shown, and nothing is sent anywhere.</p>
+<video id="video" playsinline muted></video>
+<div class="row">
+  <button id="start">Start camera</button>
+  <button id="reset">Reset</button>
+</div>
+<div class="card"><div id="status" class="muted">Idle.</div><div id="last" class="muted"></div></div>
+<div id="sessions"></div>
+<canvas id="canvas" hidden></canvas>
+
+<script src="vendor/jsQR.js"></script>
+<script>
+"use strict";
+// ---- Wire format: must match pipeline/src/esodata/wire.py and addon/qrspike ----
+const B45 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+const B45_INDEX = new Map([...B45].map((c, i) => [c, i]));
+const FRAME_RE = /^E1:([0-9A-Z]{4}):([A-Z]):(\d{1,4})\/(\d{1,4}):([0-9A-F]{4}):([0-9A-Z $%*+\-./:]*)$/;
+const SECTION_NAMES = { H: "hello", R: "research", B: "backpack", C: "craft bag", K: "bank" };
+const MAX_FRAMES = 1000;
+
+function fletcher16(s) {
+  let a = 0, b = 0;
+  for (let i = 0; i < s.length; i++) { a = (a + s.charCodeAt(i)) % 255; b = (b + a) % 255; }
+  return b * 256 + a;
+}
+function base45Decode(text) {
+  if (text.length % 3 === 1) throw new Error("base45: invalid length");
+  const out = [];
+  for (let i = 0; i < text.length; i += 3) {
+    const vals = [...text.slice(i, i + 3)].map(c => {
+      const v = B45_INDEX.get(c); if (v === undefined) throw new Error("base45: bad char"); return v; });
+    if (vals.length === 3) {
+      const v = vals[0] + vals[1] * 45 + vals[2] * 2025;
+      if (v > 0xffff) throw new Error("base45: triplet out of range");
+      out.push(v >> 8, v & 0xff);
+    } else {
+      const v = vals[0] + vals[1] * 45;
+      if (v > 0xff) throw new Error("base45: pair out of range");
+      out.push(v);
+    }
+  }
+  return Uint8Array.from(out);
+}
+function parseFrame(text) {
+  const m = FRAME_RE.exec(text);
+  if (!m) return null;
+  const [, session, section, nStr, totalStr, chk, body] = m;
+  const n = +nStr, total = +totalStr;
+  if (!(n >= 1 && n <= total && total <= MAX_FRAMES)) return null;
+  if (fletcher16(body) !== parseInt(chk, 16)) return { error: "checksum mismatch" };
+  return { session, section, n, total, body };
+}
+function reader(bytes) {
+  let i = 0;
+  return {
+    varint() {
+      let result = 0, mul = 1;
+      for (let k = 0; k < 8; k++) {
+        if (i >= bytes.length) throw new Error("varint: truncated");
+        const b = bytes[i++];
+        result += (b & 0x7f) * mul;
+        if (!(b & 0x80)) return result;
+        mul *= 128;
+      }
+      throw new Error("varint: too long");
+    },
+    done() { if (i !== bytes.length) throw new Error(`${bytes.length - i} trailing bytes`); },
+  };
+}
+function decodeSection(section, bytes) {
+  if (section === "H") {
+    let okPattern = true;
+    for (let i = 0; i < bytes.length; i++) if (bytes[i] !== ((i + 1) * 37 + 11) % 256) { okPattern = false; break; }
+    return { bytes: bytes.length, testPattern: okPattern ? "matches" : "MISMATCH" };
+  }
+  const r = reader(bytes);
+  const n = r.varint();
+  if (section === "R") {
+    if (n > 1000) throw new Error("implausible count");
+    const out = [];
+    for (let k = 0; k < n; k++) {
+      const [craftingType, line, trait, end] = [r.varint(), r.varint(), r.varint(), r.varint()];
+      out.push({ craftingType, line, trait, endsAt: new Date(end * 1000).toLocaleString() });
+    }
+    r.done(); return out;
+  }
+  if (n > 100000) throw new Error("implausible count");
+  const items = {}; let prev = 0;
+  for (let k = 0; k < n; k++) { prev += r.varint(); items[prev] = r.varint(); }
+  r.done();
+  return { distinctItems: n, items };
+}
+
+// ---- UI state ----
+const $ = id => document.getElementById(id);
+const sessions = new Map();   // key -> {session, section, total, bodies: Map, firstSeen, el}
+let scanning = false, stream = null, decodedFrames = 0, badFrames = 0;
+
+function sessionCard(key, s) {
+  if (s.el) return s.el;
+  const el = document.createElement("div"); el.className = "card";
+  el.append(Object.assign(document.createElement("div"), { className: "title" }),
+            document.createElement("progress"),
+            Object.assign(document.createElement("div"), { className: "muted info" }),
+            document.createElement("pre"));
+  $("sessions").prepend(el); s.el = el; return el;
+}
+function render(key) {
+  const s = sessions.get(key), el = sessionCard(key, s);
+  el.querySelector(".title").textContent = `${SECTION_NAMES[s.section] || s.section} · session ${s.session}`;
+  const p = el.querySelector("progress"); p.max = s.total; p.value = s.bodies.size;
+  const secs = ((performance.now() - s.firstSeen) / 1000).toFixed(1);
+  const info = el.querySelector(".info");
+  if (s.result) {
+    info.textContent = `Complete: ${s.total} frames, ${s.byteCount} bytes, ${s.doneSecs}s from first frame`;
+    info.className = "ok info";
+    el.querySelector("pre").textContent = JSON.stringify(s.result, null, 2);
+  } else if (s.error) {
+    info.textContent = `Decode error: ${s.error}`; info.className = "bad info";
+  } else {
+    const missing = [];
+    for (let i = 1; i <= s.total && missing.length < 12; i++) if (!s.bodies.has(i)) missing.push(i);
+    info.textContent = `${s.bodies.size}/${s.total} frames · ${secs}s · missing ${missing.join(", ")}${missing.length === 12 ? "…" : ""}`;
+  }
+}
+function onFrameText(text) {
+  const f = parseFrame(text);
+  if (!f) return;
+  if (f.error) { badFrames++; return; }
+  decodedFrames++;
+  const key = `${f.session}:${f.section}`;
+  let s = sessions.get(key);
+  if (!s) { s = { ...f, bodies: new Map(), firstSeen: performance.now() }; sessions.set(key, s); }
+  if (s.total !== f.total || s.result) return;
+  s.bodies.set(f.n, f.body);
+  if (s.bodies.size === s.total) {
+    try {
+      let joined = ""; for (let i = 1; i <= s.total; i++) joined += s.bodies.get(i);
+      const bytes = base45Decode(joined);
+      s.byteCount = bytes.length; s.result = decodeSection(s.section, bytes);
+      s.doneSecs = ((performance.now() - s.firstSeen) / 1000).toFixed(1);
+    } catch (e) { s.error = e.message; }
+  }
+  render(key);
+  $("last").textContent = `Last: ${f.section} ${f.n}/${f.total}`;
+}
+
+function tick() {
+  if (!scanning) return;
+  const video = $("video"), canvas = $("canvas");
+  if (video.readyState >= 2) {
+    const scale = Math.min(1, 1280 / video.videoWidth);
+    const w = Math.round(video.videoWidth * scale), h = Math.round(video.videoHeight * scale);
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, w, h);
+    const code = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" });
+    if (code && code.data) onFrameText(code.data);
+    $("status").textContent = `Scanning · ${decodedFrames} good frames · ${badFrames} bad checksums`;
+  }
+  requestAnimationFrame(tick);
+}
+
+$("start").addEventListener("click", async () => {
+  if (scanning) return;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    const video = $("video"); video.srcObject = stream; await video.play();
+    scanning = true; $("status").textContent = "Scanning…"; requestAnimationFrame(tick);
+  } catch (e) {
+    $("status").textContent = `Camera unavailable: ${e.message}. The page must be served over HTTPS.`;
+    $("status").className = "bad";
+  }
+});
+$("reset").addEventListener("click", () => {
+  sessions.clear(); $("sessions").replaceChildren(); decodedFrames = badFrames = 0; $("last").textContent = "";
+});
+</script>
+</body>
+</html>
